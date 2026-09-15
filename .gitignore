@@ -1,0 +1,79 @@
+# =========================
+# Python Artifacts
+# =========================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# =========================
+# Networking / Ryu / Mininet
+# =========================
+# Packet captures (crucial to ignore, as Wireshark/tcpdump files get huge)
+*.pcap
+*.pcapng
+*.cap
+
+# Log files (Ryu and Mininet can generate extensive logs)
+*.log
+mininet.log
+ryu.log
+ryu-manager.log
+
+# Temporary topology or flow dump files you might generate
+*.json
+*.dump
+flows.txt
+topology.xml
+
+# =========================
+# IDEs and Editors
+# =========================
+# VS Code
+.vscode/
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+\#*\#
+
+# =========================
+# OS Generated Files
+# =========================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# =========================
+# Ubuntu / Linux Specific
+# =========================
+# Core dumps (generated if Open vSwitch or Mininet crashes)
+core
+core.*
+vgcore.*
+
+# Ubuntu crash reports
+*.crash
+
+# Generic Linux temporary/backup files
+*~
+.*.swp
