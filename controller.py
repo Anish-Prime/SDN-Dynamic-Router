@@ -16,7 +16,8 @@ class SDNController(app_manager.RyuApp):
         self.mac_to_port = {}
         self.mac_to_dpid = {}
         self.net = nx.DiGraph()
-        self.flood_history = {} # Upgraded to track ALL packets
+        self.flood_history = {} 
+        self.dead_ports = set() # NEW: Tracks dead ports so Ryu doesn't revive them
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -43,39 +44,31 @@ class SDNController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         port = msg.desc
 
+        current_time = time.strftime("%H:%M:%S")
+
         # Check if the port state indicates the link went down
         if port.state & ofproto.OFPPS_LINK_DOWN:
-            current_time = time.strftime("%H:%M:%S")
+            self.dead_ports.add((datapath.id, port.port_no))
             print(f"\n==================================================")
             print(f"⚠️  [{current_time}] LINK DOWN DETECTED")
             print(f"Switch DPID: {datapath.id} | Port: {port.port_no}")
             print(f"Flushing flow tables to force route recalculation...")
             print(f"==================================================\n")
-            
-            # --- NEW FIX: Instantly sever the link in our routing graph ---
-            edges_to_remove = []
-            for u, v, data in self.net.edges(data=True):
-                # Find the edge that matches this specific switch DPID and Port
-                if u == datapath.id and data.get('port') == port.port_no:
-                    edges_to_remove.append((u, v))
-            
-            for u, v in edges_to_remove:
-                if self.net.has_edge(u, v):
-                    self.net.remove_edge(u, v)
-                # Preemptively sever the reverse direction too 
-                if self.net.has_edge(v, u): 
-                    self.net.remove_edge(v, u)
-            # --------------------------------------------------------------
+        else:
+            self.dead_ports.discard((datapath.id, port.port_no))
+            print(f"\n==================================================")
+            print(f"✅ [{current_time}] LINK UP DETECTED")
+            print(f"Switch DPID: {datapath.id} | Port: {port.port_no}")
+            print(f"==================================================\n")
 
-            # Clear our Python cache to force edge-port relearning
-            self.mac_to_port.clear()
-            self.mac_to_dpid.clear()
+        # Instantly update our graph without waiting for Ryu's slow LLDP timeouts
+        self.rebuild_topology()
 
-            # Fetch all active switches and flush their dynamic flows
-            switches = get_switch(self, None)
-            for switch in switches:
-                self.remove_flows(switch.dp)
-
+        # Fetch all active switches and flush their dynamic flows
+        switches = get_switch(self, None)
+        for switch in switches:
+            self.remove_flows(switch.dp)
+                        
     def remove_flows(self, datapath):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -97,10 +90,7 @@ class SDNController(app_manager.RyuApp):
         )
         datapath.send_msg(mod)
 
-    @set_ev_cls(event.EventSwitchEnter)
-    @set_ev_cls(event.EventLinkAdd)
-    @set_ev_cls(event.EventLinkDelete)
-    def update_topology(self, ev):
+    def rebuild_topology(self):
         self.net.clear()
         switches = get_switch(self, None)
         for switch in switches:
@@ -108,21 +98,34 @@ class SDNController(app_manager.RyuApp):
             
         links = get_link(self, None)
         for link in links:
+            # IMPORTANT: Ignore links that are connected to physically down ports
+            if (link.src.dpid, link.src.port_no) in self.dead_ports or \
+            (link.dst.dpid, link.dst.port_no) in self.dead_ports:
+                continue
+                
             self.net.add_edge(link.src.dpid, link.dst.dpid, port=link.src.port_no)
             self.net.add_edge(link.dst.dpid, link.src.dpid, port=link.dst.port_no)
         
         # --- CUSTOM PROGRESS LOGGING ---
         switch_count = len(self.net.nodes)
-        link_count = int(len(self.net.edges) / 2) # Divide by 2 because links are two-way
+        link_count = int(len(self.net.edges) / 2)
         current_time = time.strftime("%H:%M:%S")
         
         print("\n" + "="*50)
-        print("⏳ [" + current_time + "] TOPOLOGY DISCOVERY PROGRESS")
-        print("Switches Mapped: " + str(switch_count))
-        print("Links Discovered: " + str(link_count))
-        print("Switch IDs Online: " + str(list(self.net.nodes)))
+        print(f"⏳ [{current_time}] TOPOLOGY DISCOVERY PROGRESS")
+        print(f"Switches Mapped: {switch_count}")
+        print(f"Links Discovered: {link_count}")
+        print(f"Switch IDs Online: {list(self.net.nodes)}")
         print("="*50 + "\n")
+
+    @set_ev_cls(event.EventSwitchEnter)
+    @set_ev_cls(event.EventLinkAdd)
+    @set_ev_cls(event.EventLinkDelete)
+    def update_topology(self, ev):
+        # Let Ryu's background events trigger our smart builder
+        self.rebuild_topology()
         
+            
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
