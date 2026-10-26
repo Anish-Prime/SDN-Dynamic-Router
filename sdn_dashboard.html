@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SDN Dynamic Router</title>
+<style>
+:root{--bg:#060a12;--pn:#0c1220;--ln:#1a2640;--tx:#dce6f8;--mu:#6f819f;--sw:#3aa0ff;--ho:#ffb454;--ok:#35e8b0;--bad:#ff4d6a;--pk:#fff}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:radial-gradient(1100px 600px at 25% -10%,#101d3a,var(--bg));color:var(--tx);font:14px/1.45 "Segoe UI",system-ui,sans-serif;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid var(--ln);flex-wrap:wrap}
+h1{font-size:18px;margin:0;font-weight:650;letter-spacing:.2px}
+h1 small{color:var(--mu);font-weight:400;margin-left:8px}
+.sp{flex:1}
+input,select,button{background:var(--pn);color:var(--tx);border:1px solid var(--ln);border-radius:8px;padding:7px 11px;font:inherit}
+input{width:210px}
+button{cursor:pointer}button:hover{border-color:var(--sw)}
+button.on{background:#12305a;border-color:var(--sw)}
+:focus-visible{outline:2px solid var(--sw);outline-offset:2px}
+.pill{display:flex;align-items:center;gap:7px;padding:6px 12px;border:1px solid var(--ln);border-radius:99px;color:var(--mu)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--bad)}
+.pill.ok .dot{background:var(--ok);box-shadow:0 0 8px var(--ok)}.pill.ok{color:var(--tx)}
+main{flex:1;display:grid;grid-template-columns:1fr 330px;min-height:0}
+#stage{position:relative;min-height:380px}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#bar{position:absolute;left:16px;top:14px;display:none;gap:8px;flex-wrap:wrap;z-index:2}
+#hint{position:absolute;left:18px;bottom:14px;color:var(--mu);font-size:12.5px;max-width:60%}
+#legend{position:absolute;right:16px;bottom:14px;display:flex;gap:14px;color:var(--mu);font-size:12.5px}
+#legend i{display:inline-block;width:11px;height:11px;margin-right:6px;vertical-align:-1px;border-radius:3px}
+aside{border-left:1px solid var(--ln);background:#0a101c;display:flex;flex-direction:column;min-height:0}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--ln);border-bottom:1px solid var(--ln)}
+.stats div{background:#0a101c;padding:12px 16px}
+.stats b{display:block;font-size:26px;font-weight:600;font-variant-numeric:tabular-nums}
+.stats span{color:var(--mu);font-size:12.5px}
+#log{flex:1;overflow:auto;padding:10px 16px;font:12.5px/1.6 ui-monospace,Consolas,monospace}
+#log p{margin:0 0 6px;padding-left:10px;border-left:2px solid var(--ln)}
+#log .path{border-color:var(--ok)}#log .down{border-color:var(--bad);color:#ffb3bf}#log .up{border-color:var(--sw)}
+#log time{color:var(--mu);margin-right:8px}
+@media(max-width:860px){main{grid-template-columns:1fr;grid-template-rows:1fr 260px}aside{border-left:0;border-top:1px solid var(--ln)}input{width:150px}}
+</style></head><body>
+<header>
+  <h1>SDN Dynamic Router<small>Ryu · OpenFlow 1.3 · Dijkstra</small></h1>
+  <span class="sp"></span>
+  <input id="api" value="http://localhost:8080" aria-label="Ryu REST address">
+  <button id="mLive" class="on">Live</button><button id="mDemo">Demo</button>
+  <div class="pill" id="st"><span class="dot"></span><span id="stt">Connecting</span></div>
+</header>
+<main>
+  <section id="stage">
+    <canvas id="cv"></canvas>
+    <div id="bar">
+      <select id="tp" aria-label="Topology"><option>Diamond</option><option>Ring</option><option>Mesh</option></select>
+      <button id="b1">Ping h1 to last host</button><button id="b2">pingall</button><button id="b3">Restore links</button>
+    </div>
+    <div id="hint"></div>
+    <div id="legend"><span><i style="background:var(--sw)"></i>Switch</span><span><i style="background:var(--ho);border-radius:50%"></i>Host</span><span><i style="background:var(--ok)"></i>Active path</span><span><i style="background:var(--bad)"></i>Failed link</span></div>
+  </section>
+  <aside>
+    <div class="stats">
+      <div><b id="n1">0</b><span>Switches</span></div><div><b id="n2">0</b><span>Hosts</span></div>
+      <div><b id="n3">0</b><span>Paths computed</span></div><div><b id="n4">0</b><span>Link failures</span></div>
+    </div>
+    <div id="log" aria-live="polite"></div>
+  </aside>
+</main>
+<script>
+const $=s=>document.querySelector(s), cv=$('#cv'), cx=cv.getContext('2d');
+let W,H,mode='live',sws=[],hosts=[],known=new Map(),downK=new Set(),lastEv=null,first=true,
+    glow=new Map(),pulse=new Map(),packets=[],S={paths:0,breaks:0},timer;
+const K=(a,b)=>String(a)<String(b)?a+'|'+b:b+'|'+a;
+const hid=h=>h.mac, sid=d=>'s'+d, lab=id=>id[0]==='s'&&!id.includes(':')?id:(hosts.find(h=>h.mac===id)||{}).label||id;
+function fit(){const r=cv.parentElement.getBoundingClientRect(),d=devicePixelRatio||1;W=r.width;H=r.height;cv.width=W*d;cv.height=H*d;cx.setTransform(d,0,0,d,0,0)}
+addEventListener('resize',fit);
+
+/* ---------- layout: switches on a ring, hosts fan out beyond their switch ---------- */
+function P(id){
+  const R=Math.min(W,H)/2-48,n=sws.length;
+  if(id[0]==='s'&&!id.includes(':')){const i=sws.indexOf(+id.slice(1)),a=-Math.PI/2+2*Math.PI*i/Math.max(n,1);
+    return n===1?{x:W/2,y:H/2,a}:{x:W/2+Math.cos(a)*R*.5,y:H/2+Math.sin(a)*R*.5,a}}
+  const h=hosts.find(x=>x.mac===id);if(!h)return{x:W/2,y:H/2};
+  const s=P(sid(h.dpid)),mates=hosts.filter(x=>x.dpid===h.dpid),j=mates.indexOf(h),
+        a=s.a+(j-(mates.length-1)/2)*.42;
+  return{x:W/2+Math.cos(a)*R*(n===1?.7:1),y:H/2+Math.sin(a)*R*(n===1?.7:1)}
+}
+
+/* ---------- state ingestion (same path for live and demo) ---------- */
+function log(msg,cls){const l=$('#log'),p=document.createElement('p');p.className=cls||'';
+  p.innerHTML='<time>'+new Date().toLocaleTimeString([], {hour12:false})+'</time>'+msg;l.prepend(p);while(l.children.length>120)l.lastChild.remove()}
+function apply(st){
+  sws=st.switches.slice().sort((a,b)=>a-b);
+  hosts=st.hosts.map(h=>({...h,label:h.ip?'h'+h.ip.split('.').pop():h.mac.slice(-5)})).sort((a,b)=>a.label.localeCompare(b.label,undefined,{numeric:true}));
+  const cur=new Set();
+  st.links.forEach(([a,b])=>{const k=K(a,b);cur.add(k);if(!known.has(k))known.set(k,[a,b]);
+    if(downK.delete(k))log('Link s'+a+' – s'+b+' restored','up')});
+  known.forEach(([a,b],k)=>{if(!cur.has(k)&&!downK.has(k)){downK.add(k);S.breaks++;glow.delete(k);
+    log('Link s'+a+' – s'+b+' DOWN – flushing dynamic flows, rerouting','down')}});
+  $('#n1').textContent=sws.length;$('#n2').textContent=hosts.length;$('#n4').textContent=S.breaks;
+}
+function route(ids){   // animate a computed path (array of node ids)
+  S.paths++;$('#n3').textContent=S.paths;const now=performance.now();
+  for(let i=0;i<ids.length-1;i++)glow.set(K(ids[i],ids[i+1]),now+3800);
+  packets.push({ids,seg:0,d:0,trail:[]});
+  log(lab(ids[0])+' → '+lab(ids[ids.length-1])+' via '+ids.slice(1,-1).join(' → '),'path');
+}
+function onEvent(e){ if(e.type!=='path')return;
+  if(!hosts.some(h=>h.mac===e.src)||!hosts.some(h=>h.mac===e.dst))return;
+  route([e.src,...e.path.map(sid),e.dst]) }
+
+/* ---------- live mode: poll Ryu REST ---------- */
+function status(ok,t){$('#st').classList.toggle('ok',ok);$('#stt').textContent=t}
+async function poll(){
+  const b=$('#api').value.replace(/\/$/,'');
+  try{
+    const st=await(await fetch(b+'/api/state')).json();apply(st);
+    if(first){lastEv=st.last_event_id;first=false}
+    (await(await fetch(b+'/api/events?since='+lastEv)).json()).forEach(e=>{lastEv=Math.max(lastEv,e.id);onEvent(e)});
+    status(true,'Connected to Ryu');
+  }catch(e){status(false,'Controller unreachable')}
+}
+
+/* ---------- demo mode: in-browser controller (Dijkstra) ---------- */
+const D={links:[],down:new Set(),hosts:[]};
+function build(t){
+  const n=t==='Ring'?5:4;let L=[];
+  if(t==='Diamond')L=[[1,2],[1,3],[2,4],[3,4]];
+  if(t==='Ring')for(let i=1;i<=n;i++)L.push([i,i%n+1]);
+  if(t==='Mesh')for(let i=1;i<=n;i++)for(let j=i+1;j<=n;j++)L.push([i,j]);
+  D.links=L;D.down.clear();
+  D.hosts=(t==='Diamond'?[1,4,2,3]:Array.from({length:n},(_,i)=>i+1)).map((d,i)=>({mac:'00:00:00:00:00:0'+(i+1),ip:'10.0.0.'+(i+1),dpid:d,port:1}));
+  known.clear();downK.clear();S.breaks=0;glow.clear();packets=[];push();
+}
+function push(){apply({switches:[...new Set(D.links.flat())],hosts:D.hosts,links:D.links.filter(l=>!D.down.has(K(...l))).flatMap(([a,b])=>[[a,b],[b,a]])})}
+function dijkstra(a,b){
+  const dist={[a]:0},prev={},Q=new Set(sws);
+  while(Q.size){let u=null;Q.forEach(x=>{if(dist[x]!==undefined&&(u===null||dist[x]<dist[u]))u=x});
+    if(u===null)break;Q.delete(u);
+    D.links.filter(l=>!D.down.has(K(...l))&&l.includes(u)).forEach(l=>{const v=l[0]===u?l[1]:l[0],d=dist[u]+1;
+      if(dist[v]===undefined||d<dist[v]){dist[v]=d;prev[v]=u}})}
+  if(dist[b]===undefined)return null;const p=[b];while(p[0]!==a)p.unshift(prev[p[0]]);return p}
+function ping(x,y){const s=D.hosts[x],d=D.hosts[y],p=dijkstra(s.dpid,d.dpid);
+  if(!p)return log(lab(s.mac)+' → '+lab(d.mac)+' unreachable (no path)','down');
+  route([s.mac,...p.map(sid),d.mac])}
+$('#b1').onclick=()=>ping(0,D.hosts.length-1);
+$('#b2').onclick=()=>{let t=0;for(let i=0;i<D.hosts.length;i++)for(let j=i+1;j<D.hosts.length;j++)setTimeout(()=>ping(i,j),t+=420)};
+$('#b3').onclick=()=>{D.down.clear();push()};
+$('#tp').onchange=e=>build(e.target.value);
+cv.addEventListener('click',e=>{ if(mode!=='demo')return;
+  const r=cv.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
+  for(const l of D.links){const a=P(sid(l[0])),b=P(sid(l[1])),dx=b.x-a.x,dy=b.y-a.y,
+      t=Math.max(0,Math.min(1,((x-a.x)*dx+(y-a.y)*dy)/(dx*dx+dy*dy))),d=Math.hypot(x-a.x-t*dx,y-a.y-t*dy);
+    if(d<12){const k=K(...l);D.down.has(k)?D.down.delete(k):D.down.add(k);push();return}}});
+
+/* ---------- mode switching ---------- */
+function setMode(m){mode=m;clearInterval(timer);known.clear();downK.clear();S={paths:0,breaks:0};glow.clear();packets=[];first=true;
+  $('#mLive').classList.toggle('on',m==='live');$('#mDemo').classList.toggle('on',m==='demo');
+  $('#bar').style.display=m==='demo'?'flex':'none';$('#api').style.display=m==='live'?'':'none';
+  $('#n3').textContent=0;$('#n4').textContent=0;
+  $('#hint').textContent=m==='demo'?'Demo: click any switch link to cut or restore it, then ping to watch the path reroute.':'Run pingall or link s1 s2 down in Mininet. Updates arrive every 600 ms.';
+  if(m==='demo'){status(true,'Demo (simulated controller)');build($('#tp').value)}
+  else{sws=[];hosts=[];status(false,'Connecting');poll();timer=setInterval(poll,600)}}
+$('#mLive').onclick=()=>setMode('live');$('#mDemo').onclick=()=>setMode('demo');
+
+/* ---------- render loop ---------- */
+function line(a,b,col,w,dash,glowC){cx.save();cx.strokeStyle=col;cx.lineWidth=w;cx.setLineDash(dash||[]);
+  if(glowC){cx.shadowColor=glowC;cx.shadowBlur=16}cx.beginPath();cx.moveTo(a.x,a.y);cx.lineTo(b.x,b.y);cx.stroke();cx.restore()}
+function frame(t){
+  cx.clearRect(0,0,W,H);
+  hosts.forEach(h=>{const a=P(h.mac),b=P(sid(h.dpid)),g=glow.get(K(h.mac,sid(h.dpid)));
+    g>t?line(a,b,'rgba(53,232,176,'+(.35+.65*(g-t)/3800)+')',3,0,'#35e8b0'):line(a,b,'#3b3350',1.5,[4,5])});
+  known.forEach(([a,b],k)=>{const A=P(sid(a)),B=P(sid(b));
+    if(downK.has(k)){line(A,B,'rgba(255,77,106,.7)',2,[7,7]);const m={x:(A.x+B.x)/2,y:(A.y+B.y)/2};
+      cx.fillStyle='#ff4d6a';cx.font='700 20px sans-serif';cx.textAlign='center';cx.textBaseline='middle';cx.fillText('✕',m.x,m.y);return}
+    const g=glow.get(k);g>t?line(A,B,'rgba(53,232,176,'+(.4+.6*(g-t)/3800)+')',4.5,0,'#35e8b0'):line(A,B,'#27406b',2.5)});
+  sws.forEach(d=>{const p=P(sid(d)),pl=pulse.get(sid(d))>t?(pulse.get(sid(d))-t)/500:0;
+    cx.save();cx.shadowColor='#3aa0ff';cx.shadowBlur=10+26*pl;cx.fillStyle='#0f2a52';cx.strokeStyle=pl?'#bfe0ff':'#3aa0ff';cx.lineWidth=2;
+    cx.beginPath();cx.roundRect(p.x-24,p.y-18,48,36,9);cx.fill();cx.stroke();cx.restore();
+    cx.strokeStyle='#8fc8ff';cx.lineWidth=1.6;[-5,5].forEach((o,i)=>{cx.beginPath();cx.moveTo(p.x-10,p.y+o);cx.lineTo(p.x+10,p.y+o);
+      cx.lineTo(p.x+(i?6:-6)+ (i?0:0),p.y+o+(i?-3:3));cx.stroke()});
+    cx.fillStyle='#dce6f8';cx.font='600 12px "Segoe UI",sans-serif';cx.textAlign='center';cx.textBaseline='top';cx.fillText('s'+d,p.x,p.y+22)});
+  hosts.forEach(h=>{const p=P(h.mac),pl=pulse.get(h.mac)>t?(pulse.get(h.mac)-t)/500:0;
+    cx.save();cx.shadowColor='#ffb454';cx.shadowBlur=8+22*pl;cx.fillStyle='#3a2a10';cx.strokeStyle='#ffb454';cx.lineWidth=2;
+    cx.beginPath();cx.arc(p.x,p.y,15,0,7);cx.fill();cx.stroke();cx.restore();
+    cx.strokeStyle='#ffd9a0';cx.lineWidth=1.5;cx.strokeRect(p.x-6,p.y-6,12,8);cx.beginPath();cx.moveTo(p.x-3,p.y+5);cx.lineTo(p.x+3,p.y+5);cx.stroke();
+    cx.fillStyle='#dce6f8';cx.font='12px "Segoe UI",sans-serif';cx.textAlign='center';cx.textBaseline='top';cx.fillText(h.label,p.x,p.y+19)});
+  packets=packets.filter(k=>{
+    const a=P(k.ids[k.seg]),b=P(k.ids[k.seg+1]),len=Math.hypot(b.x-a.x,b.y-a.y)||1;k.d+=7;
+    if(k.d>=len){pulse.set(k.ids[k.seg+1],t+500);k.seg++;k.d=0;if(k.seg>=k.ids.length-1)return false}
+    const A=P(k.ids[k.seg]),B=P(k.ids[k.seg+1]),f=k.d/(Math.hypot(B.x-A.x,B.y-A.y)||1),x=A.x+(B.x-A.x)*f,y=A.y+(B.y-A.y)*f;
+    k.trail.push({x,y});if(k.trail.length>16)k.trail.shift();
+    k.trail.forEach((q,i)=>{cx.fillStyle='rgba(120,255,220,'+i/k.trail.length*.55+')';cx.beginPath();cx.arc(q.x,q.y,1+i/4,0,7);cx.fill()});
+    cx.save();cx.shadowColor='#7dffe0';cx.shadowBlur=22;cx.fillStyle='#fff';cx.beginPath();cx.arc(x,y,5.5,0,7);cx.fill();cx.restore();return true});
+  requestAnimationFrame(frame)}
+fit();setMode('live');requestAnimationFrame(frame);
+</script></body></html>

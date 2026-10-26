@@ -7,9 +7,18 @@ from ryu.topology import event
 from ryu.topology.api import get_switch, get_link
 import networkx as nx
 import time
+import os, sys
 
-class SDNController(app_manager.RyuApp):
+# --- DASHBOARD: make sdn_rest_api.py (same folder) importable under ryu-manager ---
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ryu.lib import hub
+from ryu.lib.packet import arp, ipv4
+from ryu.app.wsgi import WSGIApplication
+from sdn_rest_api import DashboardMixin
+
+class SDNController(DashboardMixin, app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'wsgi': WSGIApplication}   # DASHBOARD: Ryu's built-in REST server (port 8080)
 
     def __init__(self, *args, **kwargs):
         super(SDNController, self).__init__(*args, **kwargs)
@@ -18,6 +27,12 @@ class SDNController(app_manager.RyuApp):
         self.net = nx.DiGraph()
         self.flood_history = {} 
         self.dead_ports = set() # NEW: Tracks dead ports so Ryu doesn't revive them
+
+        # --- DASHBOARD additions ---
+        self.host_ip = {}        # mac -> ip (learned from ARP/IPv4 on edge ports)
+        self.flow_counts = {}    # (dpid, in_port, src, dst) -> last packet_count
+        self.init_dashboard(kwargs['wsgi'])
+        self.monitor_thread = hub.spawn(self._traffic_monitor)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -73,6 +88,7 @@ class SDNController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         
+        self.flow_counts.clear()   # DASHBOARD: counters restart after a flush
         # An empty match means it will match all flows
         empty_match = parser.OFPMatch()
         
@@ -164,6 +180,13 @@ class SDNController(app_manager.RyuApp):
             self.mac_to_port.setdefault(dpid, {})
             self.mac_to_port[dpid][eth.src] = in_port
             self.mac_to_dpid[eth.src] = dpid
+            # DASHBOARD: remember the host's IP so the UI can label it h1, h2...
+            arp_pkt = pkt.get_protocol(arp.arp)
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            if arp_pkt:
+                self.host_ip[eth.src] = arp_pkt.src_ip
+            elif ip_pkt:
+                self.host_ip[eth.src] = ip_pkt.src
 
         out_port = ofproto.OFPP_FLOOD
 
@@ -195,3 +218,49 @@ class SDNController(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=msg.data)
         datapath.send_msg(out)
+
+    # ------------------------------------------------------------------
+    # DASHBOARD: detect real traffic by polling the cookie=1 flow counters.
+    # (Once a flow is installed, later pings never reach the controller, so
+    #  PacketIn alone cannot animate repeated pings. Counters can.)
+    # ------------------------------------------------------------------
+    def _traffic_monitor(self):
+        while True:
+            try:
+                for sw in get_switch(self, None):
+                    dp = sw.dp
+                    parser = dp.ofproto_parser
+                    dp.send_msg(parser.OFPFlowStatsRequest(
+                        dp, flags=0, cookie=1, cookie_mask=0xFFFFFFFFFFFFFFFF))
+            except Exception as e:
+                self.logger.warning("traffic monitor: %s", e)
+            hub.sleep(0.5)
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        dpid = ev.msg.datapath.id
+        for stat in ev.msg.body:
+            if stat.cookie != 1:
+                continue
+            src, dst = stat.match.get('eth_src'), stat.match.get('eth_dst')
+            in_port = stat.match.get('in_port')
+            if src is None or dst is None:
+                continue
+            key = (dpid, in_port, src, dst)
+            prev = self.flow_counts.get(key, 0)
+            if stat.packet_count < prev:      # flow was reinstalled
+                prev = 0
+            self.flow_counts[key] = stat.packet_count
+            # Only the INGRESS switch of the source host reports the full path
+            is_ingress = (self.mac_to_dpid.get(src) == dpid and
+                          self.mac_to_port.get(dpid, {}).get(src) == in_port)
+            if stat.packet_count > prev and is_ingress and dst in self.mac_to_dpid:
+                self._emit_path(src, dst)
+
+    def _emit_path(self, src, dst):
+        s, d = self.mac_to_dpid[src], self.mac_to_dpid[dst]
+        try:
+            path = [s] if s == d else nx.shortest_path(self.net, s, d)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return
+        self.log_event('path', src=src, dst=dst, path=path)
